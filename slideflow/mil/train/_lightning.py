@@ -23,8 +23,7 @@ Lightning trainer that mirrors the FastAI functionality in your codebase:
 
 
 from __future__ import annotations
-import os, gc
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:true,max_split_size_mb:128")
+import os, gc 
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import inspect
 import logging
@@ -35,10 +34,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader as TorchDataLoader
 from torch.utils.data._utils.collate import default_collate
+import time, uuid
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.tuner import Tuner 
 
 from slideflow import log
 import slideflow.mil.data as data_utils
@@ -47,15 +48,151 @@ import slideflow.mil.data as data_utils
 from pathbench import losses as pb_losses
 
 # Metrics
-from lifelines.utils import concordance_index as lifelines_cindex
+from sksurv.metrics import concordance_index_censored
 from sklearn import metrics as sk_metrics
 import sklearn
 from sklearn.preprocessing import OneHotEncoder as SkOneHotEncoder
 from packaging import version as _pkg_version
 
 
+def _maybe_autofind_lr(trainer, module, train_dl, val_dl, exp_cfg):
+    # Skip if user explicitly set LR or using OneCycle with a provided max_lr
+    if "lr" in exp_cfg: 
+        return None
+
+    tuner = Tuner(trainer)
+    # Suggested ranges are typical; tweak if your tasks differ
+    lr_finder = tuner.lr_find(
+        module, 
+        train_dataloaders=train_dl, 
+        val_dataloaders=val_dl, 
+        min_lr=1e-8, 
+        max_lr=1e-3, 
+        num_training=100  # small sweep
+    )
+    suggested = lr_finder.suggestion()
+    if suggested is not None:
+        module.lr = float(suggested)          # set on the LightningModule you created
+    return suggested
+
+# ---- survival helpers ----
+# ---------- generic conversions ----------
+def _survival_to_hazards(S: torch.Tensor) -> torch.Tensor:
+    """
+    Convert per-bin survival S_k = P(T > k) into hazards h_k.
+    h_k = 1 - S_k / S_{k-1}, with S_0 := 1.0.
+    S: (N, K) in (0,1].
+    """
+    eps = 1e-9
+    S = torch.clamp(S, eps, 1.0)
+    N, K = S.shape
+    S_prev = torch.ones((N, 1), device=S.device)
+    ratio = S / torch.clamp(torch.cat([S_prev, S[:, :-1]], dim=1), eps, 1.0)
+    h = 1.0 - ratio
+    return torch.clamp(h, eps, 1.0 - eps)
+
+def _pmf_to_hazards(pmf: torch.Tensor) -> torch.Tensor:
+    """
+    Convert PMF over K bins to hazards.
+    h_k = pmf_k / S_{k-1}, S_{k-1} = Π_{j<k} (1 - h_j).
+    """
+    eps = 1e-9
+    pmf = torch.clamp(pmf, eps, 1.0)
+    N, K = pmf.shape
+    hazards = []
+    S_prev = torch.ones(N, device=pmf.device)
+    for k in range(K):
+        h_k = pmf[:, k] / torch.clamp(S_prev, eps, 1.0)
+        h_k = torch.clamp(h_k, eps, 1.0 - eps)
+        hazards.append(h_k)
+        S_prev = S_prev * (1.0 - h_k)
+    return torch.stack(hazards, dim=1)
+
+def _cumhaz_risk_from_h(h: torch.Tensor) -> torch.Tensor:
+    """Risk = cumulative hazard up to last bin: H = -Σ log(1 - h_k)."""
+    return -torch.sum(torch.log(1.0 - h), dim=1)
+
+# ---------- model-output → risk, by loss ----------
+def build_survival_risk_fn(loss_obj) -> callable:
+    """
+    Return a callable risk_fn(logits_or_scores: Tensor) -> Tensor[N]
+    based on the *loss class* you’re using.
+    Assumes your posted loss classes (names) and PyCox semantics.
+    """
+    name = loss_obj.__class__.__name__
+
+    # ---- continuous-time (Cox / pairwise ranking variants) ----
+    if name in ("CoxPHLoss", "ExponentialConcordanceLoss", "RankingLoss"):
+        # PyCox CoxPH uses linear predictor η (a.k.a. log-risk / log-hazard ratio).
+        # For c-index, higher score = higher risk ⇒ use η directly.
+        return lambda scores: scores.view(-1).float()
+
+    # ---- discrete-time: LogisticHazard / PC-Hazard (hazard logits per bin) ----
+    if name in ("NLLLogisticHazardLoss",):
+        def _risk(scores):
+            # scores: (N, K) logits for hazard per bin
+            h = torch.sigmoid(scores)
+            return _cumhaz_risk_from_h(h)
+        return _risk
+
+    # Some codebases keep PC-Hazard separate; if you add it later, treat like logistic:
+    if name in ("NLLPCHazardLoss", "PCHazardLoss",):
+        def _risk(scores):
+            h = torch.sigmoid(scores)   # if your head already outputs hazards, replace with: h = scores
+            return _cumhaz_risk_from_h(h)
+        return _risk
+
+    # ---- discrete-time: PMF (class/logits over time bins) ----
+    if name in ("NLLPMFLoss",):
+        def _risk(scores):
+            pmf = F.softmax(scores, dim=-1)
+            h = _pmf_to_hazards(pmf)
+            return _cumhaz_risk_from_h(h)
+        return _risk
+
+    # ---- discrete-time: MTLR (needs the canonical decode) ----
+    if name in ("NLLMTLRLoss",):
+        # Canonical MTLR decode (by-the-book):
+        # p_k ∝ exp( sum_{j=k..K} f_j ), then PMF→hazards→cumhaz risk.
+        def _risk(scores):
+            # scores: (N, K)
+            rev_cumsum = torch.flip(torch.cumsum(torch.flip(scores, dims=[1]), dim=1), dims=[1])
+            pmf = F.softmax(rev_cumsum, dim=1)
+            h = _pmf_to_hazards(pmf)
+            return _cumhaz_risk_from_h(h)
+        return _risk
+
+    # ---- discrete-time: BCE over survival trajectory (logits for S_k) ----
+    if name in ("BCESurvLoss",):
+        def _risk(scores):
+            # scores: (N, K) logits for survival S_k
+            S = torch.sigmoid(scores)
+            # risk = cumulative hazard = -log S_K (since H_K = -log S_K)
+            # Either use final-bin -log S_K, or decode full h then cumhaz.
+            # Both are consistent; we’ll do full decode:
+            h = _survival_to_hazards(S)
+            return _cumhaz_risk_from_h(h)
+        return _risk
+
+    # ---- local/custom discrete losses that interpret preds as hazards ----
+    if name in ("DeepHitLoss", "AdaptedCrossEntropySurvivalLoss"):
+        def _risk(preds):
+            # Your comment says preds are probs/hazards in [0,1].
+            h = torch.clamp(preds, 1e-9, 1-1e-9)
+            return _cumhaz_risk_from_h(h)
+        return _risk
+
+    # Fallback: assume per-bin hazard logits
+    def _default(scores):
+        h = torch.sigmoid(scores) if scores.ndim == 2 else scores
+        if scores.ndim == 2:
+            return _cumhaz_risk_from_h(h)
+        return scores.view(-1).float()
+    return _default
+
+
 # ---------------------------------------------------------------------
-# Utilities matching your FastAI pipeline
+# Utilities matching FastAI semantics
 # ---------------------------------------------------------------------
 
 def _make_ohe_dense() -> SkOneHotEncoder:
@@ -228,6 +365,31 @@ def _retrieve_optimizer(optimizer_name: Optional[str]) -> type:
         return getattr(torch.optim, optimizer_name)
     raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
+def _retrieve_lightning_callback(cb_name: str):
+    """
+    Try to instantiate a callback by name from:
+      1) pathbench.callbacks  (custom)
+      2) pytorch_lightning.callbacks (built-ins)
+    """
+    # 1) PathBench
+    try:
+        from pathbench import callbacks as pb_cbs
+        if hasattr(pb_cbs, cb_name):
+            return getattr(pb_cbs, cb_name)()
+    except Exception:
+        pass
+
+    # 2) Lightning callbacks namespace (e.g., "RichProgressBar")
+    if hasattr(pl.callbacks, cb_name):
+        ctor = getattr(pl.callbacks, cb_name)
+        try:
+            return ctor()
+        except TypeError:
+            # If it needs args, let user pass a dict instead of str (see below)
+            pass
+
+    raise ValueError(f"Unknown callback '{cb_name}'")
+
 
 def _wrap_forward_to_save_attention(model: nn.Module) -> None:
     _orig_fwd = model.forward
@@ -268,7 +430,12 @@ def _wrap_forward_to_save_attention(model: nn.Module) -> None:
             att = torch.ones(B, N, device=bags.device) / max(N, 1)
 
         model._last_attention = att
-        return preds
+
+        want_attention = kwargs.get("return_attention", False)
+        if want_attention:
+            return preds, att
+        else:
+            return preds
 
     model.forward = _fwd_save_att
 
@@ -317,7 +484,7 @@ class MILLightningModule(pl.LightningModule):
         *,
         task: str = "classification",
         optimizer_name: str = "Adam",
-        lr: float = 1e-3,
+        lr: float = 1e-4,
         wd: float = 0.0,
         n_classes: Optional[int] = None,
         pb_config: Optional[Dict[str, Any]] = None,
@@ -425,14 +592,20 @@ class MILLightningModule(pl.LightningModule):
 
 
     def _forward_logits(self, x, lens):
-        # Always pass lens keyword; wrapper will drop/rename if unsupported
+        # If a slide-level model gets (B, N, D), reduce to (B, D)
+        if lens is None and x.dim() == 3:
+            x = x.mean(dim=1)  # or max/attention pooling if you prefer
         return self.model(x, lens=lens) if lens is not None else self.model(x)
 
+    def set_survival_from_loss(self, base_loss : nn.Module):
+        self._risk_fn = build_survival_risk_fn(base_loss)
     # ------------- steps -------------
 
     def training_step(self, batch, batch_idx):
         x, lens, y = self._prepare_xy(batch)
         logits = self._forward_logits(x, lens)
+        if isinstance(logits, (tuple, list)):
+            logits = logits[0]  # in case model returns (preds, att)
         loss = self.criterion(logits, y) if y is not None else logits.mean() * 0
         self.log("train/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
 
@@ -445,8 +618,14 @@ class MILLightningModule(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, lens, y = self._prepare_xy(batch)
         logits = self._forward_logits(x, lens)
+        if isinstance(logits, (tuple, list)):
+            logits = logits[0]  # in case model returns (preds, att)
         loss = self.criterion(logits, y) if y is not None else logits.mean() * 0
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        try:
+            self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        except Exception:
+            pass
 
         # Accumulate for epoch-level metrics
         if y is not None:
@@ -457,16 +636,17 @@ class MILLightningModule(pl.LightningModule):
                 self._val_logits.append(logits.detach().float().cpu())  # preds
                 self._val_targets.append(y.detach().float().view_as(logits).cpu())
             elif self.task == "survival":
-                # y: [T, E]
+                # y[:,0]=duration, y[:,1]=event
                 y = y.float()
-                self._val_logits.append(logits.detach().float().cpu().view(-1))  # risk score
+                # For CoxPH/continuous models, logits ARE the risk scores (η)
+                self._val_logits.append(logits.detach().float().cpu().view(-1))
                 self._val_surv_durations.append(y[:, 0].detach().cpu().view(-1))
                 self._val_surv_events.append(y[:, 1].detach().cpu().view(-1))
+
             elif self.task == "survival_discrete":
-                # Approximate risk by sum of hazards (sigmoid over logits)
-                probs = torch.sigmoid(logits).sum(dim=-1).detach().float().cpu().view(-1)
+                # Keep RAW per-bin scores; convert to hazards at epoch end
                 y = y.float()
-                self._val_logits.append(probs)
+                self._val_logits.append(logits.detach().float().cpu())   # shape (B, K)
                 self._val_surv_durations.append(y[:, 0].detach().cpu().view(-1))
                 self._val_surv_events.append(y[:, 1].detach().cpu().view(-1))
         return {"val_loss": loss}
@@ -504,13 +684,23 @@ class MILLightningModule(pl.LightningModule):
             self.log("val/mae", mae, prog_bar=True)
 
         elif self.task in ("survival", "survival_discrete") and self._val_logits:
-            risk = torch.cat(self._val_logits).numpy()
-            durations = torch.cat(self._val_surv_durations).numpy()
-            events = torch.cat(self._val_surv_events).numpy()
+            durations = torch.cat(self._val_surv_durations).numpy().astype(np.float64)
+            events = torch.cat(self._val_surv_events).numpy().astype(np.int32).astype(bool)
+
+            logits_cat = torch.cat(self._val_logits)  # (N,) for Cox; (N,K) for discrete
+
+            base_loss = getattr(self.criterion, 'base_loss', self.criterion)
+            if hasattr(base_loss, "risk"):
+                self._risk_fn = base_loss.risk
+            else:
+                self._risk_fn = build_survival_risk_fn(base_loss)
+                
+            risk = self._risk_fn(logits_cat).numpy().astype(np.float64)
+        
             try:
-                c_index = lifelines_cindex(durations, -risk, events)  # lower risk ⇒ longer survival
-                self.log("val/c_index", float(c_index), prog_bar=True)
-                self.log("concordance_index", float(c_index), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+                c_index = float(concordance_index_censored(events, durations, risk)[0])
+                self.log("val/c_index", c_index, prog_bar=True)
+                self.log("concordance_index", c_index, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
             except Exception as e:
                 logging.debug(f"Skipping C-index: {e}")
 
@@ -552,9 +742,14 @@ class MILLightningModule(pl.LightningModule):
                     steps_per_epoch = getattr(self.trainer, "num_training_batches", None) or 1
                     total_steps = max(1, max_epochs * int(steps_per_epoch))
 
+                if "lr" not in exp_cfg and 'max_lr' not in params:
+                    max_lr_param = self.lr
+                else:
+                    max_lr_param = exp_cfg.get("max_lr", self.lr)
+                    
                 scheduler = torch.optim.lr_scheduler.OneCycleLR(
                     optimizer,
-                    max_lr=params.get("max_lr", self.lr),
+                    max_lr=params.get("max_lr", max_lr_param),
                     total_steps=int(total_steps),
                     pct_start=params.get("pct_start", 0.3),
                     anneal_strategy=params.get("anneal_strategy", "cos"),
@@ -640,7 +835,6 @@ def _build_dataloaders(
     use_lens = getattr(getattr(config, "model_config", object), "use_lens", False)
     ctx = exp_cfg.get("multiprocessing_context", "spawn") if num_workers > 0 else None
     cast_inputs_to_half = bool(exp_cfg.get("cast_inputs_to_half", False))
-    val_bag_size = exp_cfg.get("val_bag_size", bag_size)  # NEW
     pin_memory = bool(exp_cfg.get("pin_memory", False))
     prefetch_factor = int(exp_cfg.get("prefetch_factor", 2)) if num_workers > 0 else None
 
@@ -784,6 +978,7 @@ def _build_dataloaders(
     # --- class/event weights like in FastAI block ---
     class_weight_tensor: Optional[torch.Tensor] = None
     survival_weight_dict: Optional[Dict[str, float]] = None
+    bin_weight_tensor: Optional[torch.Tensor] = None
 
     if task == "classification" and class_weighting:
         train_labels = pd.Series(targets[train_idx])
@@ -802,8 +997,22 @@ def _build_dataloaders(
         if num_total > 0:
             survival_weight_dict = {"event_weight": num_cens / num_total, "censored_weight": num_events / num_total}
 
-    return train_dl, val_dl, n_in, n_out, class_weight_tensor, survival_weight_dict, encoder
+    if task == "survival_discrete" and class_weighting:
+        # Use train split to compute weights
+        train_bins = targets_np[train_idx][:, 0].astype(int)
+        counts = pd.Series(train_bins).value_counts()
+        w = counts.sum() / counts
+        w = (w / w.sum()).to_dict()
 
+        # Align to encoder.categories_[0] order (or unique sorted if encoder is None)
+        if encoder is not None:
+            bin_order = encoder.categories_[0].astype(int)
+        else:
+            bin_order = np.unique(targets_np[:, 0].astype(int))
+
+        bin_weight_tensor = torch.tensor([float(w.get(b, 1.0)) for b in bin_order], dtype=torch.float32)
+
+    return train_dl, val_dl, n_in, n_out, class_weight_tensor, survival_weight_dict, encoder, bin_weight_tensor
 
 # ---------------------------------------------------------------------
 # Public training API (backwards compatible with positional args)
@@ -826,7 +1035,7 @@ def _train_lightning_impl(
 ):
     # ---- dataloaders, dims, weights
     (train_dl, val_dl, n_in, n_out,
-     class_weight_tensor, survival_weight_dict, encoder) = _build_dataloaders(
+     class_weight_tensor, survival_weight_dict, encoder, bin_weight_tensor) = _build_dataloaders(
         config,
         bags=bags, targets=targets, train_idx=train_idx, val_idx=val_idx,
         unique_categories=unique_categories, device=device, pb_config=pb_config,
@@ -868,13 +1077,17 @@ def _train_lightning_impl(
         loss_kwargs["weight"] = class_weight_tensor.to(torch.float32)
     if task == "survival" and survival_weight_dict is not None:
         loss_kwargs.update(survival_weight_dict)
+    if task == "survival_discrete" and bin_weight_tensor is not None:
+        loss_kwargs["weight"] = bin_weight_tensor.to(torch.float32)
 
     base_loss = loss_cls(**loss_kwargs) if inspect.isclass(loss_cls) else loss_cls
     criterion = _AttentionLossWrapper(base_loss, model)
 
     # ---- trainer settings (mirrors FastAI overrides)
     exp_cfg = (pb_config or {}).get("experiment", {})
-    lr = float(exp_cfg.get("lr", getattr(config, "lr", 1e-3) or 1e-3))
+    lr_value = exp_cfg.get("lr", None)
+    lr_value = getattr(config, "lr", lr_value) if lr_value is None else lr_value
+    lr = float(1e-4 if lr_value is None else lr_value)
     wd = float(exp_cfg.get("wd", getattr(config, "wd", 0.0) or 0.0))
     opt_name = optimizer or exp_cfg.get("optimizer", "Adam")
     max_epochs = int(exp_cfg.get("epochs", getattr(config, "epochs", 1) or 1))
@@ -894,12 +1107,28 @@ def _train_lightning_impl(
         pb_config=pb_config,
         estimated_total_steps=estimated_total_steps,
     )
+    
+    if task in ("survival", "survival_discrete"):
+        module.set_survival_from_loss(base_loss)
+    
 
     # callbacks & loggers like SaveModelCallback + CSVLogger
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+        os.makedirs(os.path.join(outdir, "logs"), exist_ok=True)
+        ckpt_dir = os.path.join(outdir, "checkpoints", time.strftime("%Y-%m-%d_%H-%M-%S"))
+        os.makedirs(ckpt_dir, exist_ok=True)
+    else:
+        ckpt_dir=None
+        
     checkpoint_cb = ModelCheckpoint(
-        dirpath=outdir, filename="best-epoch", save_top_k=1,
-        monitor=best_monitor, mode="min" if "loss" in best_monitor.lower() else "max"
+        dirpath=ckpt_dir or outdir,
+        filename="best-epoch-{epoch}-{step}",
+        save_top_k=1,
+        monitor=best_monitor,
+        mode="min" if "loss" in best_monitor.lower() else "max",
     )
+        
     lr_monitor = LearningRateMonitor(logging_interval="step")
     logger = CSVLogger(save_dir=outdir if outdir else ".", name="logs")
 
@@ -914,6 +1143,31 @@ def _train_lightning_impl(
             min_delta=float(es_cfg.get("min_delta", 0.0)),
         ))
 
+    extras = cb_cfg.get("extra", [])
+    for spec in extras:
+        if isinstance(spec, str):
+            callbacks.append(_retrieve_lightning_callback(spec))
+        else:
+            name = spec.get("name")
+            params = spec.get("params", {})
+            # Try PathBench first
+            try:
+                from pathbench import callbacks as pb_cbs
+                if hasattr(pb_cbs, name):
+                    callbacks.append(getattr(pb_cbs, name)(**params))
+                    continue
+            except Exception:
+                pass
+            # Then Lightning
+            if hasattr(pl.callbacks, name):
+                callbacks.append(getattr(pl.callbacks, name)(**params))
+            else:
+                raise ValueError(f"Unknown callback '{name}'")
+            
+    accumulate = int(exp_cfg.get("accumulate_grad_batches", 1))
+    precision = exp_cfg.get("precision", None)
+    grad_clip = float(exp_cfg.get("gradient_clip_val", 0.0) or 0.0)
+
     log_every = max(1, min(10, len(train_dl)))
     trainer = pl.Trainer(
         default_root_dir=outdir,
@@ -924,7 +1178,17 @@ def _train_lightning_impl(
         callbacks=callbacks,
         logger=logger,
         enable_progress_bar=True,
+        accumulate_grad_batches=accumulate,
+        precision=precision,
+        gradient_clip_val=grad_clip,
     )
+
+    if lr is None or lr <= 0.0:
+        log.info("Learning rate not set, running auto-learning rate finder...")
+        auto_lr = _maybe_autofind_lr(trainer, module, train_dl, val_dl, exp_cfg)
+        if auto_lr is not None:
+            log.info(f"Setting auto-found lr={auto_lr:.2e}")
+            module.lr = auto_lr
 
     trainer.fit(module, train_dl, val_dl)
     return {

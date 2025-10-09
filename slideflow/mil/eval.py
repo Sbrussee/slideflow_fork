@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import logging
 from sklearn.metrics import roc_auc_score, average_precision_score, mean_absolute_error, mean_squared_error
-from lifelines.utils import concordance_index
+from sksurv.metrics import concordance_index_censored
 from sklearn.preprocessing import OneHotEncoder
 
 from rich.progress import Progress, track
@@ -17,6 +17,7 @@ from typing import Union, List, Optional, Callable, Tuple, Any, TYPE_CHECKING
 from slideflow import Dataset, log, errors
 from slideflow.util import path_to_name, location_heatmap
 from slideflow.model.extractors import rebuild_extractor
+from slideflow.mil.train._lightning import build_survival_risk_fn
 from slideflow.stats.metrics import ClassifierMetrics
 from ._params import (
     _TrainerConfig, TrainerConfigFastAI, TrainerConfigLightning
@@ -30,6 +31,40 @@ if TYPE_CHECKING:
     from slideflow.model.base import BaseFeatureExtractor
 
 # -----------------------------------------------------------------------------
+
+
+import torch.nn.functional as F
+
+def _pmf_to_hazards_np(pmf: np.ndarray) -> np.ndarray:
+    pmf = np.clip(pmf, 1e-9, 1.0)
+    N, K = pmf.shape
+    hazards = np.zeros_like(pmf, dtype=np.float64)
+    S_prev = np.ones(N, dtype=np.float64)
+    for k in range(K):
+        h_k = pmf[:, k] / np.clip(S_prev, 1e-9, 1.0)
+        hazards[:, k] = np.clip(h_k, 1e-9, 1.0 - 1e-9)
+        S_prev *= (1.0 - hazards[:, k])
+    return hazards
+
+def _cumhaz_risk_from_h_np(h: np.ndarray) -> np.ndarray:
+    return -np.sum(np.log(1.0 - np.clip(h, 1e-9, 1.0 - 1e-9)), axis=1)
+
+def _reduce_survival_preds_to_risk_from_df(df: pd.DataFrame) -> np.ndarray:
+    """
+    Fallback decode when we don't have the loss object at eval time:
+      - 1 column  -> treat as continuous Cox score (η).
+      - K columns -> treat as hazard logits per bin: risk = sum_k -log(1-h_k).
+    """
+    pred_cols = [c for c in df.columns if c.startswith('y_pred')]
+    pred_cols.sort(key=lambda c: int(c.replace('y_pred', '')))
+    preds = df[pred_cols].to_numpy().astype(np.float64)
+
+    if preds.ndim == 1 or preds.shape[1] == 1:
+        return np.squeeze(preds).astype(np.float64)
+
+    # multi-bin logits -> hazards via sigmoid, then cumulative hazard
+    hazards = 1.0 / (1.0 + np.exp(-preds))
+    return _cumhaz_risk_from_h_np(hazards)
 
 def eval_mil(
     weights: str,
@@ -168,36 +203,7 @@ def _eval_mil(
     params: Optional[dict] = None,
     **heatmap_kwargs
 ) -> pd.DataFrame:
-    """Evaluate a standard, single-mode multi-instance learning model.
-
-    Args:
-        model (torch.nn.Module): Loaded PyTorch MIL model.
-        dataset (sf.Dataset): Dataset to evaluation.
-        outcomes (str, list(str)): Outcomes.
-        bags (str, list(str)): Path to bags, or list of bag file paths.
-            Each bag should contain PyTorch array of features from all tiles in
-            a slide, with the shape ``(n_tiles, n_features)``.
-        config (:class:`slideflow.mil.TrainerConfigFastAI` or :class:`slideflow.mil.TrainerConfigCLAM`):
-            Configuration for building model.
-
-    Keyword arguments:
-        outdir (str): Path at which to save results.
-        attention_heatmaps (bool): Generate attention heatmaps for slides.
-            Defaults to False.
-        interpolation (str, optional): Interpolation strategy for smoothing
-            attention heatmaps. Defaults to 'bicubic'.
-        cmap (str, optional): Matplotlib colormap for heatmap. Can be any
-            valid matplotlib colormap. Defaults to 'inferno'.
-        norm (str, optional): Normalization strategy for assigning heatmap
-            values to colors. Either 'two_slope', or any other valid value
-            for the ``norm`` argument of ``matplotlib.pyplot.imshow``.
-            If 'two_slope', normalizes values less than 0 and greater than 0
-            separately. Defaults to None.
-
-    Returns:
-        pd.DataFrame: Dataframe of predictions.
-    """
-
+    """Evaluate a standard, single-mode multi-instance learning model."""
     task = config.to_dict().get('goal', config.to_dict().get('task', 'classification'))
 
     # Prepare lists of bags.
@@ -208,82 +214,96 @@ def _eval_mil(
         bags = dataset.pt_files(bags)
     else:
         bags = np.array([b for b in bags if path_to_name(b) in slides])
-
     logging.debug(f"bags: {bags}")
 
-    #Check for slide_level bags
+    # Predict
     if config.slide_level:
         df = predict_from_model(
-            model,
-            config,
-            dataset,
-            outcomes=outcomes,
-            bags=bags,
+            model, config, dataset,
+            outcomes=outcomes, bags=bags,
             attention=not config.slide_level,
-            uq=uq,
-            **heatmap_kwargs
+            uq=uq, **heatmap_kwargs
         )
         y_att = None
     else:
-        # Generate predictions.
         df, y_att = predict_from_model(
-            model,
-            config,
-            dataset,
-            outcomes=outcomes,
-            bags=bags,
+            model, config, dataset,
+            outcomes=outcomes, bags=bags,
             attention=not config.slide_level,
-            uq=uq,
-            **heatmap_kwargs
+            uq=uq, **heatmap_kwargs
         )
 
-
+    # ---- Metrics per task
     if task == 'survival':
-        # Calculate the concordance index for survival analysis
-        #Log the types and values of the columns in df
+        # Ensure types
         log.debug(f"DataFrame columns: {df.columns.tolist()}")
-        log.debug("DataFrame types:")
-        for col in df.columns:
-            log.debug(f"{col}: {df[col].dtype}")
-
-        #Ensure duration is of type float, event is integer and y_pred0 is float
-        df['duration'] = df['duration'].astype(float)
-        df['y_true'] = df['y_true'].astype(int)
-        df['y_pred0'] = df['y_pred0'].astype(float)
-        log.debug("DataFrame after type conversion:")
-        log.debug(df.head())
+        durations = df['duration'].to_numpy().astype(np.float64)
+        events = df['y_true'].to_numpy().astype(np.int32).astype(bool)
+        # Prefer exact decode if you can access the loss used at train time:
+        base_loss = getattr(model, 'criterion', None)
+        if base_loss is not None and hasattr(base_loss, 'base_loss'):
+            base_loss = base_loss.base_loss
+            
+        pred_cols = [c for c in df.columns if c.startswith('y_pred')]
+        pred_cols.sort(key=lambda c: int(c.replace('y_pred', '')))
+        logits = torch.from_numpy(df[pred_cols].to_numpy()).float()
         
-        c_index = concordance_index(df['duration'], -df['y_pred0'], df['y_true'])
+        if base_loss is not None:
+            risk = base_loss.risk(logits).cpu().numpy().astype(np.float64)
+        else:
+            risk = _reduce_survival_preds_to_risk_from_df(df)
+        c_index = float(concordance_index_censored(events, durations, risk)[0])
         df['c_index'] = c_index
+        log.info(f"Concordance Index: {c_index:.3f}")
+
 
     elif task == 'survival_discrete':
-        all_time_labels = np.unique(df.duration)
-        pred_scores = []
-        #Each bin should be a ground truth label, and we should have a prediction for each bin
-        for idx in range(len(all_time_labels)):
-            y_true_binary = (df['duration'] == all_time_labels[idx]).astype(int)
-            y_pred = df[f'y_pred{idx}'].values
-            pred_scores.append(y_pred)
+        # Optional per-bin diagnostics (AUC/AP); safe even if some bins are empty
+        pred_cols = [c for c in df.columns if c.startswith('y_pred')]
+        pred_cols.sort(key=lambda c: int(c.replace('y_pred', '')))
+        # If you annotated duration with arbitrary labels, per-bin AUC by matching duration==bin_idx
+        for idx, col in enumerate(pred_cols):
             try:
-                auc = roc_auc_score(y_true_binary, y_pred)
-            except ValueError as e:
-                logging.warning(f"Skipping AUC for cat #{idx+1}: {e}")
-                auc = np.nan
-            ap = average_precision_score(y_true_binary, y_pred)
-            log.info(f"AUC (time={all_time_labels[idx]}): {auc:.3f}")
-            log.info(f"AP  (time={all_time_labels[idx]}): {ap:.3f}")
+                y_true_bin = (df['duration'].to_numpy() == idx).astype(int)
+                y_pred_bin = df[col].to_numpy()
+                try:
+                    auc = roc_auc_score(y_true_bin, y_pred_bin)
+                except ValueError as e:
+                    logging.warning(f"Skipping AUC for bin {idx}: {e}")
+                    auc = np.nan
+                ap = average_precision_score(y_true_bin, y_pred_bin)
+                log.info(f"AUC (bin={idx}): {auc:.3f} | AP: {ap:.3f}")
+            except Exception as e:
+                logging.debug(f"Per-bin metric failed for {col}: {e}")
 
-        c_index = concordance_index(df['duration'], pred_scores, event_observed=df['y_true'])
-        df['c_index'] = c_index
+        durations = df['duration'].to_numpy().astype(np.float64)
+        events = df['y_true'].to_numpy().astype(np.int32).astype(bool)
+        # Same decode policy as concordance index in survival:
+        base_loss = getattr(model, 'criterion', None)
+        if base_loss is not None and hasattr(base_loss, 'base_loss'):
+            base_loss = base_loss.base_loss
+            
+        pred_cols = [c for c in df.columns if c.startswith('y_pred')]
+        pred_cols.sort(key=lambda c: int(c.replace('y_pred', '')))
+        logits = torch.from_numpy(df[pred_cols].to_numpy()).float()
         
+        if base_loss is not None:
+            risk = base_loss.risk(logits).cpu().numpy().astype(np.float64)
+        else:
+            risk = _reduce_survival_preds_to_risk_from_df(df)
+
+        c_index = float(concordance_index_censored(events, durations, risk)[0])
+        df['c_index'] = c_index
+        log.info(f"Concordance Index: {c_index:.3f}")
+
     elif task == 'regression':
-        # Calculate regression metrics
         mae = mean_absolute_error(df['y_true'], df['y_pred0'])
         mse = mean_squared_error(df['y_true'], df['y_pred0'])
         log.info(f"Mean Absolute Error: {mae:.3f}")
         log.info(f"Mean Squared Error: {mse:.3f}")
+
     else:
-        # Calculate metrics for classification
+        # Classification
         y_pred_cols = [c for c in df.columns if c.startswith('y_pred')]
         for idx in range(len(y_pred_cols)):
             y_true_binary = (df.y_true.values == idx).astype(int)
@@ -297,26 +317,29 @@ def _eval_mil(
             log.info(f"AUC (cat #{idx+1}): {auc:.3f}")
             log.info(f"AP  (cat #{idx+1}): {ap:.3f}")
 
-    # Save results.
+    # ---- Save results
     if outdir:
         if not exists(outdir):
             os.makedirs(outdir)
-        model_dir = sf.util.get_new_model_dir(outdir, config.model_config.model) #TODO(pvalkema): the name <class 'pathbench.models.aggregators.clam_mil'> is not file-system friendly -> use something else for folder names! can we pass through the save string?
+        model_dir = sf.util.get_new_model_dir(outdir, config.model_config.model)
         if params is not None:
             sf.util.write_json(params, join(model_dir, 'mil_params.json'))
         pred_out = join(model_dir, 'predictions.parquet')
         df.to_parquet(pred_out)
         log.info(f"Predictions saved to {pred_out}")
 
-    # Print categorical metrics, including per-category accuracy
-    outcome_name = outcomes if isinstance(outcomes, str) else '-'.join(outcomes)
-    metrics_df = df.rename(
-        columns={c: f"{outcome_name}-{c}" for c in df.columns if c != 'slide'}
-    )
-    sf.stats.metrics.categorical_metrics(metrics_df, level='slide')
+    # ---- Print categorical metrics for convenience (kept as in your original)
+    
+    try:
+        if task == "classification":
+            outcome_name = outcomes if isinstance(outcomes, str) else '-'.join(outcomes)
+            metrics_df = df.rename(columns={c: f"{outcome_name}-{c}" for c in df.columns if c != 'slide'})
+            sf.stats.metrics.categorical_metrics(metrics_df, level='slide')
+    except Exception as e:
+        logging.debug(f"Could not compute categorical metrics: {e}")
 
-    # Export attention
-    if outdir and y_att:
+    # ---- Export attention & heatmaps
+    if outdir and (y_att is not None) and (y_att != []):
         if 'slide' in df.columns:
             slides_or_patients = df.slide.values
         elif 'patient' in df.columns:
@@ -325,8 +348,7 @@ def _eval_mil(
             raise ValueError("Malformed dataframe; cannot find 'slide' or 'patient' column.")
         _export_attention(join(model_dir, 'attention'), y_att, slides_or_patients)
 
-    # Attention heatmaps
-    if outdir and y_att and attention_heatmaps:
+    if outdir and (y_att is not None) and (y_att != []) and attention_heatmaps:
         generate_attention_heatmaps(
             outdir=join(model_dir, 'heatmaps'),
             dataset=dataset,
@@ -336,6 +358,7 @@ def _eval_mil(
         )
 
     return df
+
 
 
 def _eval_multimodal_mil(
@@ -1109,7 +1132,7 @@ def _validate_model(
             log.warning(msg)
         else:
             raise RuntimeError(msg)
-    if uq and not inspect.signature(model.forward).parameters['uq']:
+    if uq and not inspect.signature(model.forward).parameters.get('uq', None) is not None:
         msg = (
             "Model '{}' does not support UQ. "
             "Unable to calculate uncertainty.".format(
@@ -1161,50 +1184,56 @@ def run_inference(
     else:
         kw = dict()
     try:
-        if attention and inspect.signature(model.forward).parameters['return_attention']:
-            model_out, y_att = model(*model_args, return_attention=True, **kw)
+        out = None
+        if attention and inspect.signature(model.forward).parameters.get('return_attention', None) is not None:
+            out = model(*model_args, return_attention=True, **kw)
         elif use_first_out:
-            # CLAM models return attention scores as well as logits.
-            model_out, y_att = model(*model_args, **kw)
-        elif attention:
-            model_out = model(*model_args, **kw)
-            y_att = model.calculate_attention(*model_args)
+            out = model(*model_args, **kw)
+        elif attention and hasattr(model, 'calculate_attention'):
+            out = model(*model_args, **kw)
+            try:
+                y_att = model.calculate_attention(*model_args)
+            except:
+                y_att = None
         else:
-            model_out = model(*model_args, **kw)
-    except:
-        print("No attention scores available.")
-        #Make sure input is 3D tensor
+            out = model(*model_args, **kw)
+            
+        #normalize output
+        if isinstance(out, tuple):
+            if uq and attention and len(out) >= 3:
+                model_out, y_att, y_uncertainty = out[0], out[1], out[2]
+            elif attention and len(out) == 2:
+                model_out, y_att = out[0], out[1]
+            elif uq and len(out) == 2:
+                model_out, y_uncertainty = out[0], out[1]
+            else:
+                model_out = out[0]
+        else:
+            model_out = out
+            
+    except Exception as e:
+        logging.debug(f"Error during model inference: {e}")
         if len(input.shape) == 2:
             input = input.unsqueeze(0)
             model_args = (input,)
         model_out = model(*model_args, **kw)
-
-
-
-
-    # Parse uncertainty from model output.
-    if uq:
-        y_pred, y_uncertainty = model_out
-    else:
-        y_pred = model_out
+        y_att = None
 
     if attention and y_att is not None:
         y_att = torch.squeeze(y_att)
         if len(y_att.shape) == 2:
             log.warning("Pooling attention scores from 2D to 1D")
-            # Attention needs to be pooled
             if attention_pooling == 'avg':
                 y_att = torch.mean(y_att, dim=-1)
             elif attention_pooling == 'max':
                 y_att = torch.amax(y_att, dim=-1)
             else:
-                raise ValueError(
-                    "Unrecognized attention pooling strategy '{}'".format(
-                        attention_pooling
-                    )
-                )
+                raise ValueError("Unrecognized attention pooling strategy '{}'".format(attention_pooling))
+
+    y_pred = model_out
     if apply_softmax:
         y_pred = torch.nn.functional.softmax(y_pred, dim=1)
+
     return y_pred, y_att, y_uncertainty
 
 
@@ -1271,16 +1300,33 @@ def _predict_mil(
             if _y_uq is not None:
                 _y_uq = _y_uq.cpu().numpy()
 
+            if _y_pred is not None:
+                if _y_pred.ndim == 0:
+                    _y_pred = _y_pred.reshape(1, 1)
+                elif _y_pred.ndim == 1:
+                    _y_pred = _y_pred.reshape(1, -1)
+            
+            if _y_pred is None or _y_pred.size == 0:
+                raise ValueError("Model did not return any predictions.")
             # Append to running lists.
             y_pred.append(_y_pred)
             if _y_att is not None:
                 y_att.append(_y_att)
+            
+            if _y_uq is not None and uq:
+                if _y_uq.ndim == 0:
+                    _y_uq = _y_uq.reshape(1, 1)
+                elif _y_uq.ndim == 1:
+                    _y_uq = _y_uq.reshape(1, -1)
             if _y_uq is not None:
                 uncertainty.append(_y_uq)
 
     yp = np.concatenate(y_pred, axis=0)
     if uq:
-        uncertainty = np.concatenate(uncertainty, axis=0)
+        if len(uncertainty) > 0:
+            uncertainty = np.concatenate(uncertainty, axis=0)
+        else:
+            uncertainty = None
         return yp, y_att, uncertainty
     else:
         return yp, y_att

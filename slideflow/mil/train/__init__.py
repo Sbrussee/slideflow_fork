@@ -586,7 +586,7 @@ def train_fastai(
         _fastai.train(learner, config)
 
     # Generate validation predictions.
-    df, attention = predict_from_model(
+    _pred_out = predict_from_model(
         learner.model,
         config,
         dataset=val_dataset,
@@ -596,6 +596,14 @@ def train_fastai(
         uq=uq,
         **heatmap_kwargs
     )
+    
+    if isinstance (_pred_out, tuple):
+        df, _pred_out[0]
+        attention = _pred_out[1] if len(_pred_out) > 1 else None
+    else:
+        df = _pred_out
+        attention = None
+        
     if outdir:
         pred_out = join(outdir, 'predictions.parquet')
         df.to_parquet(pred_out)
@@ -607,10 +615,18 @@ def train_fastai(
         columns={c: f"{outcome_name}-{c}" for c in df.columns if c != 'slide'},
         inplace=True
     )
-    sf.stats.metrics.categorical_metrics(df, level='slide')
-
+    try:
+        if config.to_dict().get("task") == "classification":
+            outcome_name = outcomes if isinstance(outcomes, str) else '-'.join(outcomes)
+            df.rename(
+                columns={c: f"{outcome_name}-{c}" for c in df.columns if c != 'slide'},
+                inplace=True
+            )
+            sf.stats.metrics.categorical_metrics(df, level='slide')
+    except Exception as e:
+        logging.debug(f"Could not compute categorical metrics: {e}")
     # Export attention to numpy arrays
-    if attention and outdir:
+    if attention is not None and attention != {} and outdir:
         _export_attention(
             join(outdir, 'attention'),
             attention,
@@ -618,7 +634,7 @@ def train_fastai(
         )
 
     # Attention heatmaps.
-    if attention and attention_heatmaps and outdir:
+    if attention is not None and attention_heatmaps and outdir:
         generate_attention_heatmaps(
             outdir=join(outdir, 'heatmaps'),
             dataset=val_dataset,
@@ -694,38 +710,80 @@ def _predict_and_save_outputs_like_fastai(
     **heatmap_kwargs
 ) -> Tuple[pd.DataFrame, Optional[dict]]:
     """Run predict_from_model, write predictions.parquet, log metrics, export attention, and heatmaps."""
-    # 1) predictions + attention
-    df, attention = predict_from_model(
-        model,
-        config,
-        dataset=val_dataset,
-        outcomes=outcomes,
-        bags=val_bags,
-        attention=True,
-        uq=uq,
-        **heatmap_kwargs
-    )
+    # 1) predictions (+ optional attention / UQ), normalize return
+    try:
+        pred_out = predict_from_model(
+            model,
+            config,
+            dataset=val_dataset,
+            outcomes=outcomes,
+            bags=val_bags,
+            attention=True,          # predict attention; predict_from_model will disable if unsupported
+            uq=uq,
+            **heatmap_kwargs
+        )
+    except Exception as e:
+        logging.error("predict_from_model failed in _predict_and_save_outputs_like_fastai", exc_info=True)
+        raise
+
+    df, attention, uncertainty = None, None, None
+    if isinstance(pred_out, tuple):
+        if len(pred_out) == 3:
+            df, attention, uncertainty = pred_out
+        elif len(pred_out) == 2:
+            df, attention = pred_out
+        elif len(pred_out) == 1:
+            df = pred_out[0]
+        else:
+            raise ValueError(f"Unexpected predict_from_model return length: {len(pred_out)}")
+    else:
+        df = pred_out
+
+    if df is None:
+        raise RuntimeError("predict_from_model returned no dataframe (df is None).")
 
     # 2) save predictions
     if outdir:
-        pred_out = join(outdir, "predictions.parquet")
-        df.to_parquet(pred_out)
-        log.info(f"Predictions saved to [green]{pred_out}[/]")
+        os.makedirs(outdir, exist_ok=True)
+        pred_out_path = join(outdir, "predictions.parquet")
+        df.to_parquet(pred_out_path)
+        log.info(f"Predictions saved to [green]{pred_out_path}[/]")
 
-    # 3) metrics (rename columns like FastAI)
-    _rename_outcome_columns_inplace(df, outcomes)
-    sf.stats.metrics.categorical_metrics(df, level="slide")
+    # 3) metrics (rename outcome columns like FastAI when classification)
+    try:
+        task = config.to_dict().get("goal", config.to_dict().get("task"))
+        if task == "classification":
+            _rename_outcome_columns_inplace(df, outcomes)
+            sf.stats.metrics.categorical_metrics(df, level='slide')
+    except Exception as e:
+        logging.debug(f"Could not compute categorical metrics: {e}")
 
     # 4) export attention arrays
-    if attention and outdir:
-        _export_attention(
-            join(outdir, "attention"),
-            attention,
-            [path_to_name(b) for b in val_bags]
-        )
+    if attention is not None and attention != {} and outdir:
+        # Prefer names from df to ensure alignment with attention list
+        if 'slide' in df.columns:
+            names = df['slide'].tolist()
+        elif 'patient' in df.columns:
+            names = df['patient'].tolist()
+        else:
+            # fallback to bag names
+            if isinstance(val_bags, str):
+                bag_paths = val_dataset.pt_files(val_bags)
+                names = [path_to_name(b) for b in bag_paths]
+            else:
+                names = [path_to_name(b) for b in val_bags]
 
-    # 5) optional attention heatmaps
-    if attention and attention_heatmaps and outdir:
+        if len(names) != len(attention):
+            logging.warning(f"Attention export skipped: length mismatch (names={len(names)} vs attention={len(attention)}).")
+        else:
+            _export_attention(
+                join(outdir, "attention"),
+                attention,
+                names
+            )
+
+    # 5) optional attention heatmaps (only if we also exported attention)
+    if attention is not None and attention != {} and attention_heatmaps and outdir:
         generate_attention_heatmaps(
             outdir=join(outdir, "heatmaps"),
             dataset=val_dataset,

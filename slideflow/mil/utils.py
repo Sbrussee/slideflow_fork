@@ -154,27 +154,58 @@ def load_model_weights(
     model.eval()
     return model, config
 
-
+from glob import glob
+from os.path import exists, join, isdir, getmtime
 def _find_weights_path(path: str, mil_params: Dict) -> str:
-    """Determine location of model weights from a given model directory."""
-    if exists(join(path, 'models', 'best_valid.pth')):
-        weights = join(path, 'models', 'best_valid.pth')
-    elif exists(join(path, "best-epoch.ckpt")):
-        weights = join(path, "best-epoch.ckpt")
-    elif exists(join(path, 'results', 's_0_checkpoint.pt')):
-        weights = join(path, 'results', 's_0_checkpoint.pt')
-    elif 'weights' in mil_params and mil_params['weights']:
-        if mil_params['weights'].startswith('/'):
-            weights = mil_params['weights']
-        elif mil_params['weights'].startswith('./'):
-            weights = join(path, mil_params['weights'][2:])
+    """Determine location of model weights from a given model directory.
+
+    Order of preference:
+      1) models/best_valid.pth
+      2) best-epoch.ckpt
+      3) results/s_0_checkpoint.pt
+      4) any checkpoints/**/best-epoch*.ckpt (pick most recent)
+      5) mil_params['weights'] (absolute or relative to path)
+    """
+    # 1–3: fixed locations
+    candidates = [
+        join(path, 'models', 'best_valid.pth'),
+        join(path, 'best-epoch.ckpt'),
+        join(path, 'results', 's_0_checkpoint.pt'),
+    ]
+    for cand in candidates:
+        if exists(cand):
+            return cand
+
+    # 4: recursive glob for Lightning style ckpts
+    glob_sets = [
+        glob(join(path, 'checkpoints', '**', 'best-epoch*.ckpt'), recursive=True),
+        glob(join(path, '**', 'best-epoch*.ckpt'), recursive=True),  # broader fallback
+    ]
+    for files in glob_sets:
+        if files:
+            # pick the most recent by modification time
+            files.sort(key=getmtime, reverse=True)
+            return files[0]
+
+    # 5: hint from mil_params
+    if isinstance(mil_params, dict) and mil_params.get('weights'):
+        hint = mil_params['weights']
+        if hint.startswith('/'):
+            if exists(hint):
+                return hint
+        elif hint.startswith('./'):
+            cand = join(path, hint[2:])
+            if exists(cand):
+                return cand
         else:
-            weights = join(path, mil_params['weights'])
-    else:
-        raise errors.ModelError(
-            f"Could not find model weights at path {weights}"
-        )
-    return weights
+            cand = join(path, hint)
+            if exists(cand):
+                return cand
+
+    tried = candidates + [join(path, 'checkpoints/**/best-epoch*.ckpt'), join(path, '**/best-epoch*.ckpt')]
+    raise errors.ModelError(
+        f"Could not find model weights at path {path}, tried: {tried}"
+    )
 
 
 def _load_bag(bag: Union[str, np.ndarray, "torch.Tensor"]) -> "torch.Tensor":
